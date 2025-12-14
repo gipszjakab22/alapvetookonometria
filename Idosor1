@@ -1,0 +1,236 @@
+################################################################################
+#  UNIVERZÁLIS IDŐSOR-ELEMZŐ MESTERKÓD
+################################################################################
+
+# --- 0. LÉPÉS: CSOMAGOK BETÖLTÉSE ---
+# Ha valamelyik nincs telepítve, futtasd le a konzolban: install.packages("csomagneve")
+library(readxl)       #
+library(ggplot2)      #
+library(zoo)          #
+library(mFilter)      #
+library(strucchange)  #
+library(forecast)     #
+library(tseries)      #
+library(lmtest)       #
+library(car)          # Opcionális, de hasznos lehet
+
+# ==============================================================================
+#  BEÁLLÍTÁSOK (CSAK EZT KELL MÓDOSÍTANOD!)
+# ==============================================================================
+
+# 1. Mi az Excel fájl neve? (legyen a munkakönyvtárban!)
+fajl_nev <- "Titanic_PS4.xlsx" 
+
+# 2. Mi a pontos neve az oszlopnak, amit elemezni akarsz? (Idősor változó)
+valtozo_nev <- "Google_PS4"
+
+# 3. Mi a dátum oszlop neve?
+datum_nev <- "Date"
+
+# 4. Milyen gyakoriságú az adat? (12 = havi, 4 = negyedéves, 1 = éves)
+gyakorisag <- 4 
+
+# 5. Kezdő dátum a TS objektumhoz (Év, Időszak) - pl. c(2013, 1)
+kezdo_datum <- c(2013, 1)
+
+# ==============================================================================
+#  INNENTŐL NE NYÚLJ HOZZÁ, CSAK FUTTASD SORBAN!
+# ==============================================================================
+
+# --- 1. ADATBEOLVASÁS ÉS ELŐKÉSZÍTÉS ---
+
+# Adat beolvasása dinamikusan
+adat <- read_excel(fajl_nev) #
+
+# Átnevezzük az oszlopokat a könnyebb kezelhetőségért a scripten belül
+names(adat)[names(adat) == valtozo_nev] <- "Y"
+names(adat)[names(adat) == datum_nev]   <- "Date"
+
+# Dátum formázás és idő (t) változó
+adat$Date <- as.Date(adat$Date) #
+adat$t <- 1:nrow(adat)          #
+
+# Szezonális dummyk létrehozása (automatikusan felismeri a gyakoriságot)
+if (gyakorisag == 4) {
+  adat$Szezon <- as.factor(quarters(adat$Date)) #
+} else if (gyakorisag == 12) {
+  adat$Szezon <- as.factor(months(adat$Date))
+} else {
+  adat$Szezon <- as.factor(weekdays(adat$Date)) #
+}
+
+# Ábrázolás
+ggplot(adat, aes(x=Date, y=Y)) + 
+  geom_line(color="darkblue", size=1) + 
+  theme_minimal() +
+  labs(title = paste("A(z)", valtozo_nev, "idősor alakulása")) #
+
+# ==============================================================================
+#  2. DETERMINISZTIKUS MODELLEZÉS (TREND ÉS SZEZONALITÁS)
+# ==============================================================================
+
+print("--- REGRESSZIÓS MODELLEK EREDMÉNYEI ---")
+
+# A) Lineáris Trend + Szezonális Dummy
+# Beállítjuk a referencia szintet (az első szintet veszi alapnak, vagy manuálisan Q4)
+# Itt most automatikusan az utolsó szintet vesszük referenciának (pl. Q4 vagy Dec)
+utolso_szint <- levels(adat$Szezon)[length(levels(adat$Szezon))]
+adat$Szezon <- relevel(adat$Szezon, ref = utolso_szint) #
+
+modell_lin <- lm(Y ~ t + Szezon, data=adat)
+print("Lineáris modell összefoglaló:")
+summary(modell_lin) #
+
+# B) Kvadratikus (Másodfokú) Trend
+modell_kvad <- lm(Y ~ t + I(t^2) + Szezon, data=adat)
+print("Kvadratikus modell összefoglaló:")
+summary(modell_kvad) #
+
+# C) Kontraszt Kódolás (Csak ha releváns, pl. napi adatoknál)
+# Ez a rész automatizált: létrehoz egy sum-contrast mátrixot
+n_levels <- length(levels(adat$Szezon))
+if(n_levels > 1){
+  kontraszt_mx <- contr.sum(n_levels)
+  # Nevek hozzárendelése (fontos a sorrend miatt)
+  rownames(kontraszt_mx) <- levels(adat$Szezon)
+  contrasts(adat$Szezon) <- kontraszt_mx
+  modell_kontraszt <- lm(Y ~ t + Szezon, data=adat)
+  print("Kontraszt kódolású modell (eltérés az átlagtól):")
+  print(summary(modell_kontraszt)) #
+  # Visszaállítjuk a dummy kódolást a továbbiakra
+  contrasts(adat$Szezon) <- NULL 
+}
+
+# D) Strukturális Törések vizsgálata
+print("--- STRUKTURÁLIS TÖRÉSEK ---")
+toresek <- breakpoints(adat$Y ~ 1)
+print(toresek) #
+print("Töréspontok dátumai (ha vannak):")
+if(!is.na(toresek$breakpoints[1])){
+  print(adat$Date[toresek$breakpoints]) #
+  
+  # Szakaszos modell illesztése (automatikusan az első törésre)
+  elso_tores <-toresek$breakpoints[1]
+  adat$Szakasz <- "Szakasz_1"
+  adat$Szakasz[adat$t > elso_tores] <- "Szakasz_2"
+  adat$Szakasz <- as.factor(adat$Szakasz)
+  
+  modell_tores <- lm(Y ~ t * Szakasz, data=adat)
+  print("Trendtöréses modell (Interakcióval):")
+  print(summary(modell_tores)) #
+} else {
+  print("Nem talált szignifikáns töréspontot.")
+}
+
+# ==============================================================================
+#  3. SIMÍTÁS ÉS DEKOMPOZÍCIÓ
+# ==============================================================================
+
+# TS objektum létrehozása (Szükséges a továbbiakhoz)
+adat_ts <- ts(adat$Y, start = kezdo_datum, frequency = gyakorisag) #
+
+# A) Mozgóátlag (Centrált, 5 tagú - átírhatod a k-t)
+adat$MA <- rollmean(adat$Y, k=5, fill=NA, align = "center") #
+
+# B) Hodrick-Prescott Szűrő
+# Frekvencia beállítása automatikusan
+hp_freq <- if(gyakorisag==1) 100 else if(gyakorisag==4) 1600 else 14400
+hp_szures <- hpfilter(adat$Y, freq = hp_freq, type = "lambda")
+adat$HP_Trend <- hp_szures$trend[,1] #
+
+# C) STL Dekompozíció
+stl_eredmeny <- stl(adat_ts, s.window = "periodic") # "periodic" vagy szám (pl. 7)
+plot(stl_eredmeny, main="STL Dekompozíció") #
+
+# Szezonálisan kiigazított adat elmentése
+adat$Szezon_Szurt <- as.numeric(adat_ts - stl_eredmeny$time.series[,"seasonal"])
+
+# Ábrázolás: Eredeti vs HP Trend
+ggplot(adat, aes(x=Date)) +
+  geom_line(aes(y=Y, color="Eredeti Adat"), size=1) +
+  geom_line(aes(y=HP_Trend, color="HP Trend"), size=1, linetype="dashed") +
+  theme_minimal() +
+  labs(title="Eredeti adat és HP Trend")
+
+# ==============================================================================
+#  4. SZTOCHASZTIKUS ELEMZÉS (STACIONARITÁS)
+# ==============================================================================
+
+print("--- EGYSÉGGYÖK TESZTEK (ADF & KPSS) ---")
+
+# ADF Teszt (H0: Nem stacioner. Cél: p < 0.05)
+adf_res <- adf.test(adat$Y)
+print(adf_res) #
+
+# KPSS Teszt (H0: Stacioner. Cél: p > 0.05)
+kpss_res <- kpss.test(adat$Y)
+print(kpss_res) #
+
+# Döntés a differenciázásról
+d_param <- 0
+if(adf_res$p.value > 0.05 | kpss_res$p.value < 0.05){
+  print("!!! AZ IDŐSOR VALÓSZÍNŰLEG NEM STACIONER. DIFFERENCIÁZÁS SZÜKSÉGES. !!!")
+  d_param <- 1
+  adat_diff <- diff(adat_ts)
+  plot(adat_diff, main="Differenciázott idősor")
+  print("Differenciázott sor ADF tesztje:")
+  print(adf.test(adat_diff)) #
+} else {
+  print("Az idősor stacionernek tekinthető.")
+}
+
+# ==============================================================================
+#  5. ARIMA MODELLEZÉS ÉS ELŐREJELZÉS
+# ==============================================================================
+
+print("--- ARIMA MODELL ÉPÍTÉS ---")
+
+# Korrelogramok kirajzolása (ACF és PACF)
+par(mfrow=c(2,1))
+acf(adat_ts, main="ACF (MA tagokhoz)")
+pacf(adat_ts, main="PACF (AR tagokhoz)")
+dev.off() #
+
+# Automatikus modell keresés (opcionális, de segít)
+auto_fit <- auto.arima(adat_ts)
+print("Auto.arima javaslata:")
+print(auto_fit)
+
+# KÉZI MODELL (Itt állíthatod be a p,d,q paramétereket a fentiek alapján!)
+# Ha az auto.arima (1,0,0)-t mondott, írd be azt.
+# Alapértelmezetten egy AR(1)-et futtatunk vagy a d_param szerint.
+my_order <- c(1, d_param, 0) 
+arima_modell <- arima(adat_ts, order = my_order)
+
+print(paste("Futtatott ARIMA modell:", paste(my_order, collapse=",")))
+summary(arima_modell) #
+coeftest(arima_modell) # Együtthatók tesztelése
+
+# --- DIAGNOSZTIKA ---
+reziduum <- resid(arima_modell)
+
+# 1. Fehérzaj teszt (Ljung-Box / Breusch-Godfrey)
+# H0: Nincs autokorreláció (Jó). Cél: p > 0.05
+bg_test <- bgtest(reziduum ~ 1, order=10)
+print("Breusch-Godfrey teszt (Autokorreláció):")
+print(bg_test) #
+
+# 2. Normalitás teszt
+# H0: Normális eloszlás (Jó). Cél: p > 0.05
+shapiro_res <- shapiro.test(reziduum)
+print("Shapiro-Wilk teszt (Normalitás):")
+print(shapiro_res) #
+
+# Vizuális diagnosztika
+tsdiag(arima_modell) #
+
+# --- ELŐREJELZÉS ---
+print("--- ELŐREJELZÉS (következő 8 időszakra) ---")
+eloerjelzes <- predict(arima_modell, n.ahead = 8)
+
+# Ábrázolás
+ts.plot(adat_ts, eloerjelzes$pred, lty=c(1,3), col=c("black", "red"), lwd=2,
+        main=paste("ARIMA Előrejelzés:", valtozo_nev))
+# Fekete: Múlt, Piros szaggatott: Jövő
+
+print("A kód lefutott.")
